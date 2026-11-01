@@ -65,7 +65,7 @@ python .\make_oppo_motion_photo.py --force
 ## 注意事项
 
 - 自动裁切采用居中裁切，可能损失视频画面边缘。
-- 从[Android动态照片视频格式规范](https://developer.android.com/media/platform/motion-photo-format?hl=zh-cn#video-container)来看，动态照片内部的视频的宽高比并不要求严格与照片对其，但为了保证显示效果，仍建议进行自动或手动裁切
+- 从[Android动态照片视频格式规范](https://developer.android.com/media/platform/motion-photo-format?hl=zh-cn#video-container)来看，动态照片内部的视频的宽高比并不要求严格与照片对齐，但为了保证显示效果，仍建议进行自动或手动裁切
 - 默认允许照片和视频有 0.5% 的宽高比误差；超过阈值时会触发裁切。
 - 输出文件名保留 `MP.jpg` 后缀有助于 Android 相册识别动态照片。
 - 建议在手机上分别用系统相册、Google Photos 和微信测试最终文件。
