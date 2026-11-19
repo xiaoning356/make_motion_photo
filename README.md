@@ -15,7 +15,7 @@
 
 - Python 3.10 或更高版本
 - FFmpeg（包含 `ffmpeg` 和 `ffprobe`）
-- ExifTool
+- [ExifTool](https://exiftool.org)
 - 自动裁切时需要 FFmpeg 支持 `libx264`
 
 请确保以上命令已加入系统 `PATH`。脚本不依赖第三方 Python 包。
