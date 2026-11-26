@@ -42,7 +42,6 @@ for stream in (sys.stdout, sys.stderr):
 
 
 OPPO_USER_COMMENT = "oplus_10485792"
-DEFAULT_ASPECT_TOLERANCE = 0.005  # 0.5%
 IMAGE_EXTENSIONS = {".jpg", ".jpeg"}
 VIDEO_EXTENSIONS = {".mp4", ".mov"}
 
@@ -79,18 +78,6 @@ class VideoInfo:
         return self.display_width / self.display_height
 
 
-@dataclass(frozen=True)
-class CropPlan:
-    width: int
-    height: int
-    x: int
-    y: int
-
-    @property
-    def filter(self) -> str:
-        return f"crop={self.width}:{self.height}:{self.x}:{self.y},setsar=1"
-
-
 def run_command(
     command: Sequence[str],
     *,
@@ -119,6 +106,8 @@ def find_local_file(directory: Path, filename: str) -> Path:
     exact = directory / filename
     if exact.is_file():
         return exact
+    if not directory.is_dir():
+        raise ScriptError(f"找不到输入文件：{exact}")
 
     lowered = filename.lower()
     for candidate in directory.iterdir():
@@ -277,75 +266,8 @@ def probe_video(path: Path) -> VideoInfo:
     )
 
 
-def aspect_ratios_match(
-    image: ImageInfo,
+def remux_video(
     video: VideoInfo,
-    tolerance: float,
-) -> tuple[bool, float]:
-    photo_ratio = image.aspect_ratio
-    video_ratio = video.aspect_ratio
-    difference = abs(photo_ratio - video_ratio) / photo_ratio
-    return difference <= tolerance, difference
-
-
-def make_crop_plan(image: ImageInfo, video: VideoInfo) -> CropPlan:
-    """Calculate a centered crop that gives the video the photo's aspect ratio."""
-    source_width = video.display_width
-    source_height = video.display_height
-    target_ratio = image.aspect_ratio
-    source_ratio = video.aspect_ratio
-
-    if source_ratio > target_ratio:
-        crop_height = source_height
-        crop_width = int(round(crop_height * target_ratio))
-        crop_width -= crop_width % 2
-    else:
-        crop_width = source_width
-        crop_height = int(round(crop_width / target_ratio))
-        crop_height -= crop_height % 2
-
-    crop_width = max(2, min(source_width, crop_width))
-    crop_height = max(2, min(source_height, crop_height))
-    crop_x = max(0, (source_width - crop_width) // 2)
-    crop_y = max(0, (source_height - crop_height) // 2)
-
-    return CropPlan(
-        width=crop_width,
-        height=crop_height,
-        x=crop_x,
-        y=crop_y,
-    )
-
-
-def print_manual_crop_help(
-    image: ImageInfo,
-    video: VideoInfo,
-    crop_plan: CropPlan,
-) -> None:
-    print("\n照片和视频比例不一致。")
-    print(
-        f"照片：{image.width}x{image.height}，比例 "
-        f"{image.aspect_ratio:.6f}"
-    )
-    print(
-        f"视频显示尺寸：{video.display_width}x{video.display_height}，比例 "
-        f"{video.aspect_ratio:.6f}"
-        + (f"，旋转 {video.rotation}°" if video.rotation else "")
-    )
-    print("\n可选的手动居中裁切命令：")
-    print(
-        'ffmpeg -i "<视频>" '
-        f'-vf "{crop_plan.filter}" '
-        '-c:v libx264 -crf 18 -preset medium -pix_fmt yuv420p '
-        '-c:a aac -b:a 192k -movflags +faststart "<裁切后视频>"'
-    )
-    print("\n请先保存裁切后的视频，再用视频作为输入重新运行本脚本。")
-
-
-def remux_or_crop_video(
-    image: ImageInfo,
-    video: VideoInfo,
-    crop_plan: CropPlan | None,
     output_path: Path,
 ) -> None:
     """
@@ -368,13 +290,11 @@ def remux_or_crop_video(
         "-1",
     ]
 
-    reencode_video = crop_plan is not None or video.video_codec not in {
+    reencode_video = video.video_codec not in {
         "h264",
         "hevc",
     }
     if reencode_video:
-        if crop_plan is not None:
-            command.extend(["-vf", crop_plan.filter])
         command.extend(
             [
                 "-c:v",
@@ -412,7 +332,7 @@ def remux_or_crop_video(
     )
     run_command(
         command,
-        description="重新封装或裁切视频",
+        description="重新封装视频",
     )
 
     probe = probe_video(output_path)
@@ -572,11 +492,18 @@ def validate_result(
         description="校验最终文件元数据",
     )
     metadata = json.loads(exif_result.stdout)[0]
-    if str(metadata.get("Validate", "")).upper() != "OK":
+    validate_status = str(metadata.get("Validate", "")).strip()
+    if (
+        not validate_status
+        or "error" in validate_status.lower()
+        or "Error" in metadata
+    ):
         raise ScriptError(
             "ExifTool 完整性校验未通过："
             + json.dumps(metadata, ensure_ascii=False)
         )
+    if validate_status.upper() != "OK":
+        print(f"[警告] ExifTool 校验存在非致命提示：{validate_status}")
     if metadata.get("UserComment") != OPPO_USER_COMMENT:
         raise ScriptError("最终文件的 OPPO UserComment 不正确。")
     if int(metadata.get("MotionPhoto", -1)) != 1:
@@ -652,19 +579,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="输出文件名，默认：<图片名>_OPPOMP.jpg",
     )
     parser.add_argument(
-        "--aspect-tolerance",
-        type=float,
-        default=DEFAULT_ASPECT_TOLERANCE,
-        help=(
-            "照片与视频宽高比允许的相对误差，默认 0.005（0.5%%）。"
-        ),
-    )
-    parser.add_argument(
-        "--no-auto-crop",
-        action="store_true",
-        help="比例不一致时不自动裁切，只显示尺寸和建议命令。",
-    )
-    parser.add_argument(
         "--force",
         action="store_true",
         help="允许覆盖已经存在的输出文件。",
@@ -676,15 +590,18 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    if args.aspect_tolerance < 0:
-        parser.error("--aspect-tolerance 不能为负数")
-
-    image_path = args.image.resolve()
-    video_path = args.video.resolve()
-    if not image_path.is_file():
-        image_path = find_local_file(Path.cwd(), args.image.name).resolve()
-    if not video_path.is_file():
-        video_path = find_local_file(Path.cwd(), args.video.name).resolve()
+    resolved_image = args.image.resolve()
+    resolved_video = args.video.resolve()
+    image_path = (
+        resolved_image
+        if resolved_image.is_file()
+        else find_local_file(resolved_image.parent, resolved_image.name).resolve()
+    )
+    video_path = (
+        resolved_video
+        if resolved_video.is_file()
+        else find_local_file(resolved_video.parent, resolved_video.name).resolve()
+    )
 
     validate_input_extensions(image_path, video_path)
     output_path = (
@@ -723,30 +640,10 @@ def main() -> int:
     if video.duration is not None:
         print(f"  视频时长：{video.duration:.3f} 秒")
 
-    ratios_match, ratio_difference = aspect_ratios_match(
-        image,
-        video,
-        args.aspect_tolerance,
+    print(
+        "[提示] 本脚本不会自动裁切视频；如需使视频与照片宽高比一致，"
+        "建议先手动裁切视频后再运行。"
     )
-    crop_plan: CropPlan | None = None
-    if ratios_match:
-        print(
-            f"[检查] 宽高比一致（差异 {ratio_difference * 100:.3f}%），"
-            "将直接重封装，不重新编码画面。"
-        )
-    else:
-        crop_plan = make_crop_plan(image, video)
-        print(
-            f"[检查] 宽高比不一致（差异 {ratio_difference * 100:.3f}%）。"
-        )
-        if args.no_auto_crop:
-            print_manual_crop_help(image, video, crop_plan)
-            return 2
-        print(
-            f"[处理] 将居中裁切视频到 {crop_plan.width}x{crop_plan.height}："
-            f"x={crop_plan.x}, y={crop_plan.y}。"
-            "画面边缘可能被裁掉。"
-        )
 
     with tempfile.TemporaryDirectory(prefix="oppo-motion-photo-") as temp_dir:
         temp_root = Path(temp_dir)
@@ -755,10 +652,8 @@ def main() -> int:
         staged_output = output_path.with_name(output_path.name + ".building")
 
         try:
-            remux_or_crop_video(
-                image=image,
+            remux_video(
                 video=video,
-                crop_plan=crop_plan,
                 output_path=output_video,
             )
             prepare_image(
